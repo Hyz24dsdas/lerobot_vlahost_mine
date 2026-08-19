@@ -1,0 +1,118 @@
+mode: deploy
+
+policy:
+  # Override with --policy-path to compare the 100000 checkpoint.
+  path: /home/zzx23457/权重/clothes/openpi/149999
+  device: cuda
+
+openpi:
+  repo: /home/zzx23457/openpi-hzh
+  python: /home/zzx23457/openpi-hzh/.venv/bin/python
+  config_name: pi05_hhw_tj_clothes1_uniform
+  cache_dir: /home/zzx23457/.cache/openpi
+  server_host: 127.0.0.1
+  server_port: 8000
+  startup_timeout_s: 300
+  gripper_min: 0.0
+  gripper_max: 1.0
+  observation:
+    image: top
+    left_wrist_image: wrist_L
+    right_wrist_image: wrist_R
+
+dataset:
+  root: datasets/deploy
+  repo_id: local/rollout_openpi_clothes_evaluation
+  single_task: "Neatly stack the yellow clothes on the table and place them into the basket on the left."
+
+# OpenPI rollout uses the same synchronized ROS recording and Home verification
+# path as the existing deployment wrapper. It does not manage node_manager.
+recording:
+  enabled: true
+  mode: rosbag
+  required: true
+  backend_url: http://127.0.0.1:8080
+  workspace_setup: /home/zzx23457/ws_apex/install/setup.bash
+  raw_root: /home/zzx23457/record_files/deployment_recordings
+  dataset_root: /home/zzx23457/record_files/lerobot_datasets/deployment_evaluations
+  timeout_s: 5.0
+  acquire_timeout_s: 5.0
+  fps: 30
+  recipe: mcap-gripper-quadtile
+  rdp: /home/zzx23457/robot_data_platform/tool/rdp
+  robot_type: marvin
+  video_codec: h264
+  crf: 20
+  gop: 2
+  keep_raw_after_convert: true
+  task: "Neatly stack the yellow clothes on the table and place them into the basket on the left."
+
+robot:
+  type: marvain_m6_http
+  id: marvin_http_openpi_001
+  http_base_url: http://127.0.0.1:8010
+  timeout: 5.0
+  action_chunk_path: /action_chunk
+  joint_names:
+    - left_arm_joint_1
+    - left_arm_joint_2
+    - left_arm_joint_3
+    - left_arm_joint_4
+    - left_arm_joint_5
+    - left_arm_joint_6
+    - left_arm_joint_7
+    - right_arm_joint_1
+    - right_arm_joint_2
+    - right_arm_joint_3
+    - right_arm_joint_4
+    - right_arm_joint_5
+    - right_arm_joint_6
+    - right_arm_joint_7
+    - left_gripper
+    - right_gripper
+  cameras:
+    top:
+      type: http
+      fps: 30
+      width: 640
+      height: 480
+      color_mode: rgb
+    wrist_L:
+      type: http
+      fps: 30
+      width: 640
+      height: 480
+      color_mode: rgb
+    wrist_R:
+      type: http
+      fps: 30
+      width: 640
+      height: 480
+      color_mode: rgb
+  safety_stats_path: /home/zzx23457/openpi_deployment_assets/tj_clothes1
+  action_clip_margin_deg: 0.05
+  max_relative_target_deg: 0.08
+  warn_on_observation_out_of_range: true
+
+inference:
+  type: chunk
+  # pi0.5 predicts 50 actions. Dispatch one second at 30 Hz per inference.
+  n_action_steps: 30
+  chunk_interval_s: 1.0
+  fps: 30.0
+  duration: 0.0
+  max_steps: 10000
+  strategy: base
+  interpolation_multiplier: 1
+  return_to_initial_position: true
+  home_tolerance_rad: 0.12
+  home_verify_timeout_s: 12.0
+  use_torch_compile: false
+  show_cameras: true
+  cameras_override:
+    - top
+    - wrist_L
+    - wrist_R
+  rtc:
+    execution_horizon: 30
+    max_guidance_weight: 10.0
