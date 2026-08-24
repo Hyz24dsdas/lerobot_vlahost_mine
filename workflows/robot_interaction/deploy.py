@@ -57,6 +57,7 @@
 import argparse
 import atexit
 import ctypes
+import hashlib
 import json
 import os
 import shlex
@@ -122,6 +123,14 @@ def resolve_policy_path(path: str) -> Path:
     return Path(__file__).parent.parent.parent / p
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _tcp_port_open(host: str, port: int, timeout_s: float = 0.5) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout_s):
@@ -130,27 +139,20 @@ def _tcp_port_open(host: str, port: int, timeout_s: float = 0.5) -> bool:
         return False
 
 
+def _tcp_port_bound(host: str, port: int) -> bool:
+    """Check local listener readiness without connecting to a WebSocket server."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((host, port))
+    except OSError:
+        return True
+    return False
+
+
 def _wait_for_policy_server(
     proc: subprocess.Popen,
     host: str,
     port: int,
-    timeout_s: float,
-) -> bool:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            print(f"OpenPI policy server exited during startup with code {proc.returncode}")
-            return False
-        if _tcp_port_open(host, port):
-            return True
-        time.sleep(0.5)
-    print(f"OpenPI policy server did not become ready at {host}:{port} within {timeout_s:.0f}s")
-    return False
-
-
-def _wait_for_ready_file(
-    proc: subprocess.Popen,
-    ready_file: Path,
     timeout_s: float,
     label: str,
 ) -> bool:
@@ -159,10 +161,10 @@ def _wait_for_ready_file(
         if proc.poll() is not None:
             print(f"{label} exited during startup with code {proc.returncode}")
             return False
-        if ready_file.is_file():
+        if _tcp_port_bound(host, port):
             return True
         time.sleep(0.5)
-    print(f"{label} did not become ready within {timeout_s:.0f}s")
+    print(f"{label} did not become ready at {host}:{port} within {timeout_s:.0f}s")
     return False
 
 
@@ -262,25 +264,67 @@ def _start_deployment_recording(config: dict) -> Path | None:
 
     raw_root = _recording_raw_root(config)
     raw_root.mkdir(parents=True, exist_ok=True)
+    configure_timeout_s = float(recording.get("configure_timeout_s", 20.0))
+    configure_attempts = int(recording.get("configure_attempts", 3))
+    configure_retry_delay_s = float(recording.get("configure_retry_delay_s", 1.0))
+    if configure_timeout_s <= 0.0 or configure_attempts <= 0 or configure_retry_delay_s < 0.0:
+        print("❌ Recording was not started: invalid recorder configuration retry settings")
+        return None
+
+    recorder_node = "/tj/data_bag_recorder"
+    recorder_param = "record_bags_storage_dir"
+    configured = False
     try:
-        set_path = _run_ros_cli(
+        current_path = _run_ros_cli(
             config,
-            [
-                "ros2",
-                "param",
-                "set",
-                "/tj/data_bag_recorder",
-                "record_bags_storage_dir",
-                str(raw_root),
-            ],
+            ["ros2", "param", "get", recorder_node, recorder_param],
+            timeout_s=min(configure_timeout_s, 5.0),
         )
     except subprocess.TimeoutExpired:
-        print("❌ Recording was not started: timed out while configuring the ROS recorder")
-        return None
-    if set_path.returncode != 0 or "successful" not in set_path.stdout.lower():
+        current_path = None
+    if (
+        current_path is not None
+        and current_path.returncode == 0
+        and str(raw_root) in current_path.stdout
+    ):
+        configured = True
+
+    last_config_error = ""
+    for attempt in range(1, configure_attempts + 1):
+        if configured:
+            break
+        try:
+            set_path = _run_ros_cli(
+                config,
+                [
+                    "ros2",
+                    "param",
+                    "set",
+                    recorder_node,
+                    recorder_param,
+                    str(raw_root),
+                ],
+                timeout_s=configure_timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            last_config_error = f"attempt {attempt}/{configure_attempts} timed out"
+        else:
+            if set_path.returncode == 0 and "successful" in set_path.stdout.lower():
+                configured = True
+                break
+            last_config_error = (
+                set_path.stderr.strip()
+                or set_path.stdout.strip()
+                or f"attempt {attempt}/{configure_attempts} failed"
+            )
+        if attempt < configure_attempts:
+            print(f"⚠️  ROS recorder configuration failed ({last_config_error}); retrying...")
+            time.sleep(configure_retry_delay_s)
+
+    if not configured:
         print(
-            "❌ Recording was not started: cannot set recorder output directory: "
-            f"{set_path.stderr.strip() or set_path.stdout.strip()}"
+            "❌ Recording was not started: cannot configure recorder output directory "
+            f"after {configure_attempts} attempts: {last_config_error}"
         )
         return None
 
@@ -753,9 +797,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--model",
-        choices=["act", "openpi", "internvla"],
+        choices=["act", "openpi", "internvla", "lingbotva"],
         default="act",
-        help="模型后端：act（默认）、openpi 或 internvla"
+        help="模型后端：act（默认）、openpi、internvla 或 lingbotva"
     )
     parser.add_argument(
         "--config",
@@ -872,6 +916,7 @@ def main() -> int:
             "act": "deploy_config_chunk.yaml",
             "openpi": "deploy_config_openpi.yaml",
             "internvla": "deploy_config_internvla.yaml",
+            "lingbotva": "deploy_config_lingbotva.yaml",
         }[args.model]
         args.config = Path(__file__).parent / config_name
     config = load_config(args.config)
@@ -903,7 +948,7 @@ def main() -> int:
         if "rtc" not in config["inference"]:
             config["inference"]["rtc"] = {}
         config["inference"]["rtc"]["max_guidance_weight"] = args.max_guidance_weight
-    if args.duration:
+    if args.duration is not None:
         config["inference"]["duration"] = args.duration
     if args.interpolation_multiplier:
         config["inference"]["interpolation_multiplier"] = args.interpolation_multiplier
@@ -1107,22 +1152,40 @@ def main() -> int:
     openpi_server_host = "127.0.0.1"
     openpi_server_port = 8000
     openpi_startup_timeout_s = 300.0
-    internvla_runtime_dir: Path | None = None
-    internvla_ready_file: Path | None = None
-    internvla_start_file: Path | None = None
+    internvla_server_cmd: list[str] | None = None
+    internvla_server_cwd: Path | None = None
+    internvla_server_env: dict[str, str] | None = None
+    internvla_server_host = "127.0.0.1"
+    internvla_server_port = 8001
     internvla_startup_timeout_s = 300.0
+    lingbotva_server_cmd: list[str] | None = None
+    lingbotva_server_cwd: Path | None = None
+    lingbotva_server_env: dict[str, str] | None = None
+    lingbotva_server_host = "127.0.0.1"
+    lingbotva_server_port = 8002
+    lingbotva_startup_timeout_s = 900.0
 
     if args.model == "openpi":
         openpi_cfg = config.get("openpi", {})
         openpi_server_cwd = Path(openpi_cfg.get("repo", "")).expanduser().resolve()
-        openpi_python = Path(openpi_cfg.get("python", "")).expanduser().resolve()
+        openpi_uv = Path(openpi_cfg.get("uv", "")).expanduser().resolve()
+        expected_origin = str(
+            openpi_cfg.get(
+                "expected_origin",
+                "https://github.com/Physical-Intelligence/openpi.git",
+            )
+        )
         serve_script = openpi_server_cwd / "scripts" / "serve_policy.py"
+        openpi_client_src = openpi_server_cwd / "packages" / "openpi-client" / "src"
         rollout_script = Path(__file__).parent / "openpi_rollout.py"
-        asset_id = "tj_clothes1"
+        asset_id = str(openpi_cfg["asset_id"])
         required_paths = {
             "OpenPI repository": openpi_server_cwd,
-            "OpenPI Python": openpi_python,
+            "OpenPI Git metadata": openpi_server_cwd / ".git",
+            "OpenPI uv executable": openpi_uv,
+            "OpenPI virtualenv": openpi_server_cwd / ".venv" / "bin" / "python",
             "serve_policy.py": serve_script,
+            "official openpi-client": openpi_client_src / "openpi_client",
             "openpi_rollout.py": rollout_script,
             "checkpoint params": policy_path / "params",
             "checkpoint norm stats": policy_path / "assets" / asset_id / "norm_stats.json",
@@ -1134,12 +1197,38 @@ def main() -> int:
                 print(f"  - {item}")
             return 2
 
+        try:
+            origin_result = subprocess.run(
+                ["git", "-C", str(openpi_server_cwd), "remote", "get-url", "origin"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Unable to verify the external OpenPI Git origin: {exc}")
+            return 2
+        actual_origin = origin_result.stdout.strip()
+        if origin_result.returncode != 0 or actual_origin != expected_origin:
+            print("Refusing to start an unverified OpenPI repository:")
+            print(f"  expected origin: {expected_origin}")
+            print(f"  actual origin:   {actual_origin or '<unavailable>'}")
+            return 2
+        print(f"✓ External OpenPI repository: {openpi_server_cwd}")
+        print(f"✓ OpenPI origin: {actual_origin}")
+        print(f"✓ OpenPI client source: {openpi_client_src}")
+
         openpi_server_host = str(openpi_cfg.get("server_host", "127.0.0.1"))
         openpi_server_port = int(openpi_cfg.get("server_port", 8000))
         openpi_startup_timeout_s = float(openpi_cfg.get("startup_timeout_s", 300.0))
         config_name = str(openpi_cfg["config_name"])
         openpi_server_cmd = [
-            str(openpi_python),
+            str(openpi_uv),
+            "run",
+            "--project",
+            str(openpi_server_cwd),
+            "--frozen",
+            "--no-sync",
             str(serve_script),
             f"--port={openpi_server_port}",
             "policy:checkpoint",
@@ -1174,6 +1263,9 @@ def main() -> int:
         env["OPENPI_DATA_HOME"] = str(
             Path(openpi_cfg.get("cache_dir", "~/.cache/openpi")).expanduser().resolve()
         )
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(openpi_client_src), env.get("PYTHONPATH", "")) if p
+        )
         env.setdefault("JAX_PLATFORMS", "cuda")
         env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
         env.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.85")
@@ -1183,16 +1275,42 @@ def main() -> int:
         internvla_repo = Path(internvla_cfg.get("repo", "")).expanduser().resolve()
         internvla_python = Path(internvla_cfg.get("python", "")).expanduser().resolve()
         qwen_path = Path(internvla_cfg.get("qwen_path", "")).expanduser().resolve()
+        expected_origin = str(
+            internvla_cfg.get(
+                "expected_origin",
+                "https://github.com/InternRobotics/InternVLA-A-series.git",
+            )
+        )
+        expected_revision = str(internvla_cfg.get("expected_revision", "")).strip()
+        expected_modeling_sha256 = str(
+            internvla_cfg.get("modeling_sha256", "")
+        ).strip().lower()
+        policy_server_script = Path(__file__).parent / "internvla_policy_server.py"
         rollout_script = Path(__file__).parent / "internvla_rollout.py"
+        safety_stats_path = Path(config["robot"].get("safety_stats_path", "")).expanduser().resolve()
+        modeling_path = (
+            internvla_repo
+            / "src"
+            / "lerobot"
+            / "policies"
+            / "internvla_a1_5"
+            / "modeling_internvla_a1_5.py"
+        )
         required_paths = {
-            "InternVLA repository": internvla_repo / "src" / "lerobot",
+            "InternVLA Git metadata": internvla_repo / ".git",
+            "InternVLA project": internvla_repo / "pyproject.toml",
+            "InternVLA policy source": modeling_path,
             "InternVLA Python": internvla_python,
+            "InternVLA policy server": policy_server_script,
             "InternVLA rollout": rollout_script,
             "Qwen3.5 config": qwen_path / "config.json",
             "Qwen3.5 tokenizer": qwen_path / "tokenizer.json",
+            "Qwen3.5 tokenizer config": qwen_path / "tokenizer_config.json",
             "checkpoint config": policy_path / "config.json",
             "checkpoint weights": policy_path / "model.safetensors",
             "checkpoint stats": policy_path / "stats.json",
+            "checkpoint training config": policy_path / "train_config.json",
+            "robot safety statistics": safety_stats_path / "meta" / "stats.json",
         }
         missing = [f"{label}: {path}" for label, path in required_paths.items() if not path.exists()]
         if missing:
@@ -1201,26 +1319,303 @@ def main() -> int:
                 print(f"  - {item}")
             return 2
 
+        try:
+            origin_result = subprocess.run(
+                ["git", "-C", str(internvla_repo), "remote", "get-url", "origin"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            revision_result = subprocess.run(
+                ["git", "-C", str(internvla_repo), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Unable to verify the external InternVLA repository: {exc}")
+            return 2
+        actual_origin = origin_result.stdout.strip()
+        actual_revision = revision_result.stdout.strip()
+        if origin_result.returncode != 0 or actual_origin != expected_origin:
+            print("Refusing to start an unverified InternVLA repository:")
+            print(f"  expected origin: {expected_origin}")
+            print(f"  actual origin:   {actual_origin or '<unavailable>'}")
+            return 2
+        if expected_revision and (
+            revision_result.returncode != 0 or actual_revision != expected_revision
+        ):
+            print("Refusing to start an unexpected InternVLA revision:")
+            print(f"  expected revision: {expected_revision}")
+            print(f"  actual revision:   {actual_revision or '<unavailable>'}")
+            return 2
+        actual_modeling_sha256 = _sha256_file(modeling_path)
+        if expected_modeling_sha256 and actual_modeling_sha256 != expected_modeling_sha256:
+            print("Refusing to start an unexpected InternVLA deployment implementation:")
+            print(f"  expected SHA256: {expected_modeling_sha256}")
+            print(f"  actual SHA256:   {actual_modeling_sha256}")
+            return 2
+        print(f"✓ External InternVLA repository: {internvla_repo}")
+        print(f"✓ InternVLA origin: {actual_origin}")
+        print(f"✓ InternVLA revision: {actual_revision}")
+        print(f"✓ InternVLA deployment implementation SHA256: {actual_modeling_sha256}")
+
+        internvla_server_host = str(internvla_cfg.get("server_host", "127.0.0.1"))
+        if internvla_server_host not in {"127.0.0.1", "localhost"}:
+            print("InternVLA policy server must bind to loopback only")
+            return 2
+        internvla_server_port = int(internvla_cfg.get("server_port", 8001))
         internvla_startup_timeout_s = float(internvla_cfg.get("startup_timeout_s", 300.0))
-        internvla_runtime_dir = Path("/tmp") / f"internvla-deploy-{os.getpid()}"
-        internvla_ready_file = internvla_runtime_dir / "model.ready"
-        internvla_start_file = internvla_runtime_dir / "rollout.start"
-        cmd = [
+        internvla_server_cwd = internvla_repo
+        internvla_server_env = os.environ.copy()
+        internvla_server_env["PYTHONPATH"] = os.pathsep.join(
+            p
+            for p in (str(internvla_repo / "src"), internvla_server_env.get("PYTHONPATH", ""))
+            if p
+        )
+        internvla_server_env["HF_HUB_OFFLINE"] = "1"
+        internvla_server_env["TRANSFORMERS_OFFLINE"] = "1"
+        internvla_server_env["INTERNVLA_INIT_FROM_CONFIG"] = "1"
+        internvla_server_cmd = [
             str(internvla_python),
-            str(rollout_script),
+            str(policy_server_script),
             "--config",
             str(args.config.resolve()),
             "--checkpoint",
             str(policy_path),
-            "--ready-file",
-            str(internvla_ready_file),
-            "--start-file",
-            str(internvla_start_file),
+            "--host",
+            internvla_server_host,
+            "--port",
+            str(internvla_server_port),
         ]
-        env["PYTHONPATH"] = f"{internvla_repo / 'src'}:{env.get('PYTHONPATH', '')}"
-        env["HF_HUB_OFFLINE"] = "1"
-        env["TRANSFORMERS_OFFLINE"] = "1"
-        env["INTERNVLA_INIT_FROM_CONFIG"] = "1"
+        cmd = [
+            sys.executable,
+            str(rollout_script),
+            "--config",
+            str(args.config.resolve()),
+            "--policy-host",
+            internvla_server_host,
+            "--policy-port",
+            str(internvla_server_port),
+        ]
+
+    elif args.model == "lingbotva":
+        lingbotva_cfg = config.get("lingbotva", {})
+        lingbotva_repo = Path(lingbotva_cfg.get("repo", "")).expanduser().resolve()
+        lingbotva_python = Path(lingbotva_cfg.get("python", "")).expanduser().resolve()
+        base_model_path = Path(
+            lingbotva_cfg.get("base_model_path", "")
+        ).expanduser().resolve()
+        openpi_client_src = Path(
+            lingbotva_cfg.get("openpi_client_src", "")
+        ).expanduser().resolve()
+        checkpoint_report = Path(
+            lingbotva_cfg.get("checkpoint_report", policy_path / "_TRANSFER_VERIFIED.json")
+        ).expanduser().resolve()
+        expected_origin = str(
+            lingbotva_cfg.get(
+                "expected_origin",
+                "https://github.com/Robbyant/lingbot-va.git",
+            )
+        )
+        expected_revision = str(lingbotva_cfg.get("expected_revision", "")).strip()
+        expected_server_sha256 = str(
+            lingbotva_cfg.get("server_sha256", "")
+        ).strip().lower()
+        expected_modeling_sha256 = str(
+            lingbotva_cfg.get("modeling_sha256", "")
+        ).strip().lower()
+        server_script = (
+            lingbotva_repo
+            / "wan_va"
+            / "hzh_code"
+            / "serve_policy_openpi_lingbot_va.py"
+        )
+        modeling_path = lingbotva_repo / "wan_va" / "modules" / "model.py"
+        rollout_script = Path(__file__).parent / "lingbotva_rollout.py"
+        safety_stats_path = Path(
+            config["robot"].get("safety_stats_path", "")
+        ).expanduser().resolve()
+
+        required_paths = {
+            "LingBot-VA Git metadata": lingbotva_repo / ".git",
+            "LingBot-VA project": lingbotva_repo / "pyproject.toml",
+            "LingBot-VA model source": modeling_path,
+            "LingBot-VA policy server": server_script,
+            "LingBot-VA rollout": rollout_script,
+            "LingBot-VA Python": lingbotva_python,
+            "OpenPI websocket client": openpi_client_src / "openpi_client",
+            "base VAE config": base_model_path / "vae" / "config.json",
+            "base VAE weights": base_model_path / "vae" / "diffusion_pytorch_model.safetensors",
+            "base tokenizer": base_model_path / "tokenizer" / "spiece.model",
+            "base tokenizer config": base_model_path / "tokenizer" / "tokenizer_config.json",
+            "base text encoder config": base_model_path / "text_encoder" / "config.json",
+            "base text encoder index": base_model_path / "text_encoder" / "model.safetensors.index.json",
+            "base text encoder shard 1": base_model_path / "text_encoder" / "model-00001-of-00003.safetensors",
+            "base text encoder shard 2": base_model_path / "text_encoder" / "model-00002-of-00003.safetensors",
+            "base text encoder shard 3": base_model_path / "text_encoder" / "model-00003-of-00003.safetensors",
+            "checkpoint transformer config": policy_path / "transformer" / "config.json",
+            "checkpoint transformer weights": policy_path / "transformer" / "diffusion_pytorch_model.safetensors",
+            "checkpoint transfer report": checkpoint_report,
+            "robot safety statistics": safety_stats_path / "meta" / "stats.json",
+        }
+        missing = [
+            f"{label}: {path}"
+            for label, path in required_paths.items()
+            if not path.exists()
+        ]
+        if missing:
+            print("LingBot-VA deployment resources are incomplete:")
+            for item in missing:
+                print(f"  - {item}")
+            return 2
+
+        try:
+            origin_result = subprocess.run(
+                ["git", "-C", str(lingbotva_repo), "remote", "get-url", "origin"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            revision_result = subprocess.run(
+                ["git", "-C", str(lingbotva_repo), "rev-parse", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"Unable to verify the external LingBot-VA repository: {exc}")
+            return 2
+        actual_origin = origin_result.stdout.strip()
+        actual_revision = revision_result.stdout.strip()
+        if origin_result.returncode != 0 or actual_origin != expected_origin:
+            print("Refusing to start an unverified LingBot-VA repository:")
+            print(f"  expected origin: {expected_origin}")
+            print(f"  actual origin:   {actual_origin or '<unavailable>'}")
+            return 2
+        if expected_revision and (
+            revision_result.returncode != 0 or actual_revision != expected_revision
+        ):
+            print("Refusing to start an unexpected LingBot-VA revision:")
+            print(f"  expected revision: {expected_revision}")
+            print(f"  actual revision:   {actual_revision or '<unavailable>'}")
+            return 2
+
+        actual_server_sha256 = _sha256_file(server_script)
+        actual_modeling_sha256 = _sha256_file(modeling_path)
+        if expected_server_sha256 and actual_server_sha256 != expected_server_sha256:
+            print("Refusing to start an unexpected LingBot-VA policy server implementation")
+            print(f"  expected SHA256: {expected_server_sha256}")
+            print(f"  actual SHA256:   {actual_server_sha256}")
+            return 2
+        if expected_modeling_sha256 and actual_modeling_sha256 != expected_modeling_sha256:
+            print("Refusing to start an unexpected LingBot-VA model implementation")
+            print(f"  expected SHA256: {expected_modeling_sha256}")
+            print(f"  actual SHA256:   {actual_modeling_sha256}")
+            return 2
+
+        try:
+            transfer_report = json.loads(checkpoint_report.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"Unable to read the LingBot-VA checkpoint verification report: {exc}")
+            return 2
+        report_files = {
+            item.get("path"): item
+            for item in transfer_report.get("files", [])
+            if isinstance(item, dict)
+        }
+        expected_checkpoint_files = {
+            "transformer/config.json": str(
+                lingbotva_cfg.get("transformer_config_sha256", "")
+            ).lower(),
+            "transformer/diffusion_pytorch_model.safetensors": str(
+                lingbotva_cfg.get("transformer_weights_sha256", "")
+            ).lower(),
+        }
+        if transfer_report.get("status") != "verified":
+            print("LingBot-VA checkpoint transfer report is not verified")
+            return 2
+        for relative_path, expected_sha256 in expected_checkpoint_files.items():
+            item = report_files.get(relative_path)
+            checkpoint_file = policy_path / relative_path
+            if (
+                item is None
+                or item.get("sha256", "").lower() != expected_sha256
+                or checkpoint_file.stat().st_size != int(item.get("size", -1))
+            ):
+                print(f"LingBot-VA checkpoint verification failed: {relative_path}")
+                return 2
+        if _sha256_file(policy_path / "transformer" / "config.json") != expected_checkpoint_files["transformer/config.json"]:
+            print("LingBot-VA transformer config SHA256 does not match the transferred source")
+            return 2
+
+        print(f"✓ External LingBot-VA repository: {lingbotva_repo}")
+        print(f"✓ LingBot-VA origin: {actual_origin}")
+        print(f"✓ LingBot-VA revision: {actual_revision}")
+        print(f"✓ LingBot-VA server SHA256: {actual_server_sha256}")
+        print(f"✓ LingBot-VA checkpoint transfer report: {checkpoint_report}")
+
+        lingbotva_server_host = str(lingbotva_cfg.get("server_host", "127.0.0.1"))
+        if lingbotva_server_host not in {"127.0.0.1", "localhost"}:
+            print("LingBot-VA policy server must bind to loopback only")
+            return 2
+        lingbotva_server_port = int(lingbotva_cfg.get("server_port", 8002))
+        lingbotva_startup_timeout_s = float(
+            lingbotva_cfg.get("startup_timeout_s", 900.0)
+        )
+        lingbotva_server_cwd = lingbotva_repo
+        lingbotva_server_env = os.environ.copy()
+        lingbotva_server_env["PYTHONPATH"] = os.pathsep.join(
+            p
+            for p in (str(lingbotva_repo), lingbotva_server_env.get("PYTHONPATH", ""))
+            if p
+        )
+        lingbotva_server_env["HF_HUB_OFFLINE"] = "1"
+        lingbotva_server_env["TRANSFORMERS_OFFLINE"] = "1"
+        lingbotva_server_env["TOKENIZERS_PARALLELISM"] = "false"
+        lingbotva_server_env["PYTHONNOUSERSITE"] = "1"
+        lingbotva_server_env["CUDA_VISIBLE_DEVICES"] = "0"
+        lingbotva_server_env["MASTER_ADDR"] = "127.0.0.1"
+        lingbotva_server_env["MASTER_PORT"] = str(
+            int(lingbotva_cfg.get("master_port", 18002))
+        )
+        lingbotva_server_cmd = [
+            str(lingbotva_python),
+            str(server_script),
+            "--config-name",
+            str(lingbotva_cfg.get("config_name", "tj_clothes1")),
+            "--host",
+            lingbotva_server_host,
+            "--port",
+            str(lingbotva_server_port),
+            "--base-model-path",
+            str(base_model_path),
+            "--transformer-path",
+            str(policy_path / "transformer"),
+            "--save-root",
+            str(Path(lingbotva_cfg.get("save_root", "~/lingbotva_deployment_runs")).expanduser()),
+            "--default-prompt",
+            str(config["dataset"]["single_task"]),
+        ]
+        cmd = [
+            sys.executable,
+            str(rollout_script),
+            "--config",
+            str(args.config.resolve()),
+            "--policy-host",
+            lingbotva_server_host,
+            "--policy-port",
+            str(lingbotva_server_port),
+        ]
+        if args.duration is not None:
+            cmd.extend(["--duration", str(config["inference"]["duration"])])
+        env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(openpi_client_src), env.get("PYTHONPATH", "")) if p
+        )
 
     # Hybrid 机器人：rollout 进程要直接 import MarvinRobotWrapper，
     # 需要把 libMarvinSDK.so / libKine.so 所在的目录加进 LD_LIBRARY_PATH。
@@ -1231,6 +1626,10 @@ def main() -> int:
 
     if openpi_server_cmd is not None:
         print(f"\n$ {' '.join(shlex.quote(c) for c in openpi_server_cmd)}")
+    if internvla_server_cmd is not None:
+        print(f"\n$ {' '.join(shlex.quote(c) for c in internvla_server_cmd)}")
+    if lingbotva_server_cmd is not None:
+        print(f"\n$ {' '.join(shlex.quote(c) for c in lingbotva_server_cmd)}")
     print(f"\n$ {' '.join(shlex.quote(c) for c in cmd)}\n")
 
     if args.dry_run:
@@ -1238,7 +1637,8 @@ def main() -> int:
         return 0
 
     openpi_server_proc: subprocess.Popen | None = None
-    internvla_rollout_proc: subprocess.Popen | None = None
+    internvla_server_proc: subprocess.Popen | None = None
+    lingbotva_server_proc: subprocess.Popen | None = None
     if openpi_server_cmd is not None:
         client_host = "127.0.0.1" if openpi_server_host in {"0.0.0.0", "::"} else openpi_server_host
         if _tcp_port_open(client_host, openpi_server_port):
@@ -1259,6 +1659,7 @@ def main() -> int:
             client_host,
             openpi_server_port,
             openpi_startup_timeout_s,
+            "OpenPI policy server",
         ):
             try:
                 os.killpg(openpi_server_proc.pid, signal.SIGTERM)
@@ -1268,29 +1669,69 @@ def main() -> int:
             return 2
         print(f"OpenPI policy server ready at {client_host}:{openpi_server_port}")
 
-    if internvla_runtime_dir is not None:
-        internvla_runtime_dir.mkdir(parents=True, exist_ok=False)
+    if internvla_server_cmd is not None:
+        if _tcp_port_open(internvla_server_host, internvla_server_port):
+            print(
+                f"InternVLA port {internvla_server_host}:{internvla_server_port} is already in use; "
+                "refusing to replace or reuse an unmanaged server"
+            )
+            return 2
         print("Loading InternVLA checkpoint before recording or robot connection...")
-        internvla_rollout_proc = subprocess.Popen(
-            cmd,
-            cwd=Path(config["internvla"]["repo"]).expanduser().resolve(),
-            env=env,
+        internvla_server_proc = subprocess.Popen(
+            internvla_server_cmd,
+            cwd=internvla_server_cwd,
+            env=internvla_server_env,
             preexec_fn=_child_preexec,
         )
-        if not _wait_for_ready_file(
-            internvla_rollout_proc,
-            internvla_ready_file,
+        if not _wait_for_policy_server(
+            internvla_server_proc,
+            internvla_server_host,
+            internvla_server_port,
             internvla_startup_timeout_s,
-            "InternVLA rollout",
+            "InternVLA policy server",
         ):
             try:
-                os.killpg(internvla_rollout_proc.pid, signal.SIGTERM)
+                os.killpg(internvla_server_proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            internvla_rollout_proc.wait(timeout=10)
-            shutil.rmtree(internvla_runtime_dir, ignore_errors=True)
+            internvla_server_proc.wait(timeout=10)
             return 2
-        print("InternVLA checkpoint loaded; waiting for recording readiness")
+        print(
+            f"InternVLA policy server ready at "
+            f"{internvla_server_host}:{internvla_server_port}"
+        )
+
+    if lingbotva_server_cmd is not None:
+        if _tcp_port_open(lingbotva_server_host, lingbotva_server_port):
+            print(
+                f"LingBot-VA port {lingbotva_server_host}:{lingbotva_server_port} is already in use; "
+                "refusing to replace or reuse an unmanaged server"
+            )
+            return 2
+        print("Loading LingBot-VA checkpoint before recording or robot connection...")
+        lingbotva_server_proc = subprocess.Popen(
+            lingbotva_server_cmd,
+            cwd=lingbotva_server_cwd,
+            env=lingbotva_server_env,
+            preexec_fn=_child_preexec,
+        )
+        if not _wait_for_policy_server(
+            lingbotva_server_proc,
+            lingbotva_server_host,
+            lingbotva_server_port,
+            lingbotva_startup_timeout_s,
+            "LingBot-VA policy server",
+        ):
+            try:
+                os.killpg(lingbotva_server_proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            lingbotva_server_proc.wait(timeout=10)
+            return 2
+        print(
+            f"LingBot-VA policy server ready at "
+            f"{lingbotva_server_host}:{lingbotva_server_port}"
+        )
 
     # The recorder is independent of policy execution and only subscribes to
     # state/command/image topics. Starting it before rollout guarantees that the
@@ -1309,14 +1750,18 @@ def main() -> int:
             except ProcessLookupError:
                 pass
             openpi_server_proc.wait(timeout=10)
-        if internvla_rollout_proc is not None:
+        if internvla_server_proc is not None:
             try:
-                os.killpg(internvla_rollout_proc.pid, signal.SIGTERM)
+                os.killpg(internvla_server_proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-            internvla_rollout_proc.wait(timeout=10)
-        if internvla_runtime_dir is not None:
-            shutil.rmtree(internvla_runtime_dir, ignore_errors=True)
+            internvla_server_proc.wait(timeout=10)
+        if lingbotva_server_proc is not None:
+            try:
+                os.killpg(lingbotva_server_proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            lingbotva_server_proc.wait(timeout=10)
         return 2
     recording_watchdog = (
         _spawn_recording_watchdog(config, recording_path)
@@ -1324,13 +1769,9 @@ def main() -> int:
         else None
     )
 
-    # Release a preloaded InternVLA process only after recording is active.
-    if internvla_start_file is not None:
-        internvla_start_file.write_text("start\n", encoding="ascii")
-
     # Run the child with robust process management.
     try:
-        proc = internvla_rollout_proc or subprocess.Popen(
+        proc = subprocess.Popen(
             cmd,
             env=env,
             preexec_fn=_child_preexec,
@@ -1348,13 +1789,16 @@ def main() -> int:
                 os.killpg(openpi_server_proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        if internvla_rollout_proc is not None:
+        if internvla_server_proc is not None:
             try:
-                os.killpg(internvla_rollout_proc.pid, signal.SIGTERM)
+                os.killpg(internvla_server_proc.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
-        if internvla_runtime_dir is not None:
-            shutil.rmtree(internvla_runtime_dir, ignore_errors=True)
+        if lingbotva_server_proc is not None:
+            try:
+                os.killpg(lingbotva_server_proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         raise
 
     direct_dataset_watchdog = (
@@ -1389,10 +1833,19 @@ def main() -> int:
         except FileNotFoundError as e:
             print(f"⚠️  Failed to launch show_cameras.py: {e}（continuing without preview）")
 
-    # 所有受 wrapper 管理的子进程：rollout、可选 preview、可选 OpenPI server。
+    # All processes here were created by this wrapper. External ROS/robot
+    # services are never included in shutdown handling.
     # rollout first ensures robot action production stops before model teardown.
     managed_procs: list[subprocess.Popen] = [
-        p for p in (proc, show_cameras_proc, openpi_server_proc) if p is not None
+        p
+        for p in (
+            proc,
+            show_cameras_proc,
+            openpi_server_proc,
+            internvla_server_proc,
+            lingbotva_server_proc,
+        )
+        if p is not None
     ]
     signal_forward_procs: list[subprocess.Popen] = [
         p for p in (proc, show_cameras_proc) if p is not None
@@ -1436,8 +1889,6 @@ def main() -> int:
                     p.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
-        if internvla_runtime_dir is not None:
-            shutil.rmtree(internvla_runtime_dir, ignore_errors=True)
 
     recording_state = {
         "active": recording_path is not None,

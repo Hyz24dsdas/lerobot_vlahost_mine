@@ -69,3 +69,29 @@ def test_prepare_action_preserves_raw_gripper_values(http_robot):
     assert payload["gripper_right"] == pytest.approx(0.75)
     assert result["left_gripper.pos"] == pytest.approx(0.25)
     assert result["right_gripper.pos"] == pytest.approx(0.75)
+
+
+def test_send_action_chunk_forwards_source_hz(http_robot):
+    robot, session = http_robot
+    session.post.return_value = MagicMock()
+    robot._connected = True
+    action = {f"{name}.pos": 0.0 for name in robot.config.joint_names}
+
+    result = robot.send_action_chunk([action, action], source_hz=7.5)
+
+    assert len(result) == 2
+    _, kwargs = session.post.call_args
+    assert kwargs["json"]["source_hz"] == pytest.approx(7.5)
+    assert len(kwargs["json"]["actions"]) == 2
+
+
+@pytest.mark.parametrize("source_hz", [0.0, -1.0, float("nan"), float("inf")])
+def test_send_action_chunk_rejects_invalid_source_hz(http_robot, source_hz):
+    robot, session = http_robot
+    robot._connected = True
+    action = {f"{name}.pos": 0.0 for name in robot.config.joint_names}
+
+    with pytest.raises(ValueError, match="source_hz must be finite and positive"):
+        robot.send_action_chunk([action], source_hz=source_hz)
+
+    session.post.assert_not_called()

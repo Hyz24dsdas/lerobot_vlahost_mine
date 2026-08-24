@@ -1,44 +1,36 @@
 mode: deploy
 
 policy:
-  path: /home/zzx23457/权重/clothes/internvla/150000/pretrained_model
-  device: cuda:0
+  # Override with --policy-path to compare the 100000 checkpoint.
+  path: /home/zzx23457/权重/clothes/openpi/pi0.5fine_tuning_tj_tankai_200_weights/149999
+  device: cuda
 
-internvla:
-  # The model implementation is loaded from this external InternVLA checkout.
-  # lerobot_vlahost-main only provides orchestration and the HTTP robot driver.
-  repo: /home/zzx23457/InternVLA-A-series
-  expected_origin: https://github.com/InternRobotics/InternVLA-A-series.git
-  expected_revision: d9b545554a96355a77323dcd778a8c091c002812
-  modeling_sha256: eb57593c77209c4189dff5b3844cbc7e7170bb4a51f08c42ab418aae4977979a
-  vlahost_repo: /home/zzx23457/lerobot_vlahost-main
-  python: /home/zzx23457/miniconda3/envs/internvla_a1_5/bin/python
-  qwen_path: /home/zzx23457/models/internvla_a1_5/Qwen3.5-2B
-  stats_robot_type: marvin
-  inference_backend: optimized
-  action_loss_only: true
-  use_sdpa: true
-  compile_model: false
+openpi:
+  # External native OpenPI checkout. deploy.py verifies this Git origin before startup.
+  repo: /home/zzx23457/openpi-official
+  expected_origin: https://github.com/Physical-Intelligence/openpi.git
+  uv: /home/zzx23457/.local/bin/uv
+  config_name: pi05_hhw_tj_tankai_200_uniform
+  cache_dir: /home/zzx23457/.cache/openpi
   server_host: 127.0.0.1
-  server_port: 8001
+  server_port: 8000
   startup_timeout_s: 300
-  request_timeout_s: 300
-  max_prompt_length: 650
-  image_resolution: [224, 224]
   gripper_min: 0.0
   gripper_max: 1.0
   observation:
-    image0: top
-    image1: wrist_L
-    image2: wrist_R
-
+    image: top
+    left_wrist_image: wrist_L
+    right_wrist_image: wrist_R
+  asset_id: tankai_200
 dataset:
   root: datasets/deploy
-  repo_id: local/rollout_internvla_clothes_evaluation
-  single_task: "Neatly stack the yellow clothes on the table and place them into the basket on the left."
+  repo_id: local/rollout_openpi_tankai_evaluation
+  single_task: "Spread out the crumpled garment on the table until it is fully open and flat."
 
+# OpenPI rollout uses the same synchronized ROS recording and Home verification
+# path as the existing deployment wrapper. It does not manage node_manager.
 recording:
-  enabled: true
+  enabled: false
   mode: rosbag
   required: true
   backend_url: http://127.0.0.1:8080
@@ -55,15 +47,14 @@ recording:
   crf: 20
   gop: 2
   keep_raw_after_convert: true
-  task: "Neatly stack the yellow clothes on the table and place them into the basket on the left."
+  task: "Spread out the crumpled garment on the table until it is fully open and flat."
 
 robot:
   type: marvain_m6_http
-  id: marvin_http_internvla_001
+  id: marvin_http_openpi_001
   http_base_url: http://127.0.0.1:8010
   timeout: 5.0
   action_chunk_path: /action_chunk
-  default_gripper_pos: 0.0
   joint_names:
     - left_arm_joint_1
     - left_arm_joint_2
@@ -100,14 +91,14 @@ robot:
       width: 640
       height: 480
       color_mode: rgb
-  safety_stats_path: /home/zzx23457/internvla_deployment_assets/tj_clothes1
-  # The HTTP driver keeps policy joint values in radians despite legacy *_deg names.
+  safety_stats_path: /home/zzx23457/openpi_deployment_assets/tankai_200
   action_clip_margin_deg: 0.05
   max_relative_target_deg: 0.08
   warn_on_observation_out_of_range: true
 
 inference:
   type: chunk
+  # pi0.5 predicts 50 actions. Dispatch one second at 30 Hz per inference.
   n_action_steps: 30
   chunk_interval_s: 1.0
   fps: 30.0

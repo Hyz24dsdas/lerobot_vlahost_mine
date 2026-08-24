@@ -20,7 +20,9 @@ policy:
   # path: /home/zzx23457/lerobot_vlahost-main/datasets/model/act_test_merged_50_300k_100_100/checkpoints/120000/pretrained_model #50条数据叠衣服
   # path: /home/zzx23457/lerobot_vlahost-main/datasets/model/act_clothes_8_12+13+14_200_300k_100_100/checkpoints/220000/pretrained_model  #22 20第一次失败  16运气 14以后没测
   # path: /home/zzx23457/lerobot_vlahost-main/datasets/model/act_8_14_blue_zm_78_300k_100_100/checkpoints/260000/pretrained_model  # 蓝色 24可以
-  path: /home/zzx23457/lerobot_vlahost-main/datasets/model/act_final_8_12_13_14_blue_yellow_278_300k_100_100_batch8/checkpoints/300000/pretrained_model
+  path: /home/zzx23457/权重/zadai/act_8_22_zadai_200_300k_100_100_bs8/checkpoints/280000/pretrained_model
+  # /home/zzx23457/权重/clothes/act_clothes/act_8_19_tankai_50_300k_100_100_bs8/checkpoints/300000/pretrained_model
+  # /home/zzx23457/lerobot_vlahost-main/datasets/model/act_zadai_8_18_50_300k_100_100_bs8/checkpoints/260000/pretrained_model
   # /home/zzx23457/lerobot_vlahost-main/datasets/model/act_clothes_8_12+13_150_300k_100_100/checkpoints/160000/pretrained_model # 150条，正反面都有，后100条加入了拖动对折
   # path: /home/zzx23457/lerobot/outputs/train/act_26-07-01-14-37-04_0111_v2_20260717_232743/checkpoints/050000/pretrained_model
   # path: /home/zzx23457/lerobot/outputs/train/act_26-07-01-14-37-04_0111_v2_20260718_011353/checkpoints/100000/pretrained_model
@@ -52,7 +54,7 @@ dataset:
 # Closing the terminal, SIGTERM/SIGHUP, abnormal exit, Home failure, or answering
 # "no" at the prompt deletes the exact staging dataset created by that run.
 recording:
-  enabled: true
+  enabled: false
   mode: direct_lerobot
   # Fail closed: never run a robot evaluation if its dataset cannot be created.
   required: true
@@ -178,7 +180,7 @@ inference:
   # - highlight: Ring buffer, save on keypress
   # - dagger: Human-in-the-loop correction mode
   # - episodic: Episode-oriented recording with reset phases
-  strategy: episodic
+  strategy: base
 
   # Action interpolation multiplier (chunk mode ignores this; keep 1)
   interpolation_multiplier: 1

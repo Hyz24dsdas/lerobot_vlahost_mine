@@ -603,7 +603,12 @@ class MarvainM6HttpRobot(Robot):
         return result
 
     @check_if_not_connected
-    def send_action_chunk(self, actions: list[RobotAction]) -> list[RobotAction]:
+    def send_action_chunk(
+        self,
+        actions: list[RobotAction],
+        *,
+        source_hz: float | None = None,
+    ) -> list[RobotAction]:
         """Send a whole action chunk to the HTTP endpoint in a single request.
 
         Each element of ``actions`` is a 16-value target dict, same format as
@@ -623,12 +628,18 @@ class MarvainM6HttpRobot(Robot):
 
         Args:
             actions: Ordered list of 16-value target dictionaries.
+            source_hz: Optional source waypoint rate. The VLAHost server uses
+                this value when interpolating the chunk to its playback rate.
 
         Returns:
             The list of actions actually sent; only arm targets may be clipped.
         """
         if not actions:
             return []
+        if source_hz is not None:
+            source_hz = float(source_hz)
+            if not np.isfinite(source_hz) or source_hz <= 0.0:
+                raise ValueError(f"source_hz must be finite and positive, got {source_hz}")
 
         chunk_payload: list[dict] = []
         results: list[RobotAction] = []
@@ -642,6 +653,8 @@ class MarvainM6HttpRobot(Robot):
 
         # url = f"{send_http_base_url}{self.config.action_chunk_path}"
         body = {"actions": chunk_payload}
+        if source_hz is not None:
+            body["source_hz"] = source_hz
         try:
             response = self._session.post(url, json=body, timeout=self.config.timeout)
             response.raise_for_status()
