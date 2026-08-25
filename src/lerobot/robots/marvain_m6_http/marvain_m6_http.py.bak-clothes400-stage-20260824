@@ -97,30 +97,6 @@ class MarvainM6HttpRobot(Robot):
         self._safety_bounds: np.ndarray | None = None  # shape (16, 2) = [min, max] in degrees
         self._safety_warned: set[int] = set()
         self._last_sent_pos: list[float] | None = None  # in degrees
-        self._last_chunk_metadata: dict | None = None
-        self._last_observation_generation: int | None = None
-
-    @property
-    def last_chunk_metadata(self) -> dict | None:
-        return (
-            dict(self._last_chunk_metadata)
-            if self._last_chunk_metadata is not None
-            else None
-        )
-
-    @property
-    def last_observation_generation(self) -> int | None:
-        return self._last_observation_generation
-
-    def _capture_observation_generation(self, state: dict) -> None:
-        intervention = state.get("intervention")
-        if not isinstance(intervention, dict):
-            self._last_observation_generation = None
-            return
-        generation = intervention.get("refresh_generation")
-        self._last_observation_generation = (
-            int(generation) if generation is not None else None
-        )
 
     # ------------------------------------------------------------------
     # Unit conversion helpers
@@ -433,7 +409,6 @@ class MarvainM6HttpRobot(Robot):
                 raise ValueError(
                     f"HTTP /state returned non-dict body (got {type(data).__name__}): {data!r}"
                 )
-            self._capture_observation_generation(data)
 
             # Check for quad_image
             self._has_quad_image = "quad_image" in data and data["quad_image"] is not None
@@ -490,7 +465,6 @@ class MarvainM6HttpRobot(Robot):
                 raise ValueError(
                     f"HTTP /state returned non-dict body (got {type(data).__name__}): {data!r}"
                 )
-            self._capture_observation_generation(data)
 
             # 关节位置按接口契约从 data["joint_states"]["positions"] 读取。
             # 服务端 vlahost 当前不返回 joint_states，缺字段时如实报错（不引入假值），
@@ -607,20 +581,6 @@ class MarvainM6HttpRobot(Robot):
     # Action
     # ------------------------------------------------------------------
     @check_if_not_connected
-    def sync_action_reference(self, observation: RobotObservation) -> None:
-        """Reset relative-action limiting to the robot's current measured arm pose."""
-        try:
-            arm_positions = np.asarray(
-                [observation[f"{name}.pos"] for name in self.config.joint_names[:14]],
-                dtype=np.float64,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError("Observation does not contain a valid 14-D measured arm pose") from exc
-        if arm_positions.shape != (14,) or not np.isfinite(arm_positions).all():
-            raise ValueError("Observation does not contain a finite 14-D measured arm pose")
-        self._last_sent_pos = arm_positions.tolist()
-
-    @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         """Send action command to HTTP endpoint.
 
@@ -695,17 +655,9 @@ class MarvainM6HttpRobot(Robot):
         body = {"actions": chunk_payload}
         if source_hz is not None:
             body["source_hz"] = source_hz
-        if self._last_observation_generation is not None:
-            body["observation_generation"] = self._last_observation_generation
         try:
             response = self._session.post(url, json=body, timeout=self.config.timeout)
             response.raise_for_status()
-            metadata = response.json()
-            if not isinstance(metadata, dict) or not metadata.get("success", False):
-                raise DeviceNotConnectedError(
-                    f"VLAHost rejected action chunk: {metadata!r}"
-                )
-            self._last_chunk_metadata = metadata
         except requests.RequestException as e:
             raise DeviceNotConnectedError(self._action_error_msg(url, e)) from e
 

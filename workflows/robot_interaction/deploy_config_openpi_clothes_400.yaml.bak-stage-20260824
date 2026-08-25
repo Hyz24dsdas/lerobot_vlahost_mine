@@ -1,8 +1,7 @@
 mode: deploy
 
 policy:
-  # Override with --policy-path to compare the 100000 checkpoint.
-  path: /home/zzx23457/权重/zadai/pi0.5fine_tuning_tj_zadai_200_weights/149999
+  path: /home/zzx23457/权重/clothes/openpi/pi0.5fine_tuning_tj_clothes_400_weights/149999
   device: cuda
 
 openpi:
@@ -10,7 +9,7 @@ openpi:
   repo: /home/zzx23457/openpi-official
   expected_origin: https://github.com/Physical-Intelligence/openpi.git
   uv: /home/zzx23457/.local/bin/uv
-  config_name: pi05_hhw_tj_zadai_200_uniform
+  config_name: pi05_hhw_tj_clothes_400_uniform
   cache_dir: /home/zzx23457/.cache/openpi
   server_host: 127.0.0.1
   server_port: 8000
@@ -21,44 +20,22 @@ openpi:
     image: top
     left_wrist_image: wrist_L
     right_wrist_image: wrist_R
-  asset_id: zadai_200
+  asset_id: clothes_400
+
 dataset:
   root: datasets/deploy
-  repo_id: local/rollout_openpi_zadai_evaluation
-  single_task: "Insert the tail of the yellow cable tie into its head to fasten it."
+  repo_id: local/rollout_openpi_clothes_400_evaluation
+  # The checkpoint was trained with prompt_from_task=True on two exact task strings.
+  # For spreading instead, set this and recording.task to:
+  # "Pick up the crumpled garment from the center of the table and spread it out until it is fully open and flat."
+  single_task: "Fold the fully spread garment neatly, then place it into the basket on the left."
 
 # OpenPI rollout uses the same synchronized ROS recording and Home verification
 # path as the existing deployment wrapper. It does not manage node_manager.
-intervention:
-  enabled: true
-  required: true
-  session_path: /intervention/session
-  heartbeat_sec: 0.5
-  timeout_sec: 2.0
-
 recording:
-  enabled: true
+  enabled: false
   mode: rosbag
   required: true
-  convert_to_lerobot: false
-  topics:
-    - /control/user/joint_cmd_A
-    - /control/user/joint_cmd_B
-    - /control/qp_controller/joint_cmd_A
-    - /control/qp_controller/joint_cmd_B
-    - /control/joint_cmd_A
-    - /control/joint_cmd_B
-    - /control/vr/gripperValueL
-    - /control/vr/gripperValueR
-    - /control/gripperValueL
-    - /control/gripperValueR
-    - /control/input_mode
-    - /control/enableL
-    - /control/enableR
-    - /control/footkey
-    - /info/vr_connected
-    - /vlahost/intervention_trace
-    - /vlahost/intervention_control_active
   backend_url: http://127.0.0.1:8080
   workspace_setup: /home/zzx23457/ws_apex/install/setup.bash
   raw_root: /home/zzx23457/record_files/deployment_recordings
@@ -73,7 +50,7 @@ recording:
   crf: 20
   gop: 2
   keep_raw_after_convert: true
-  task: "Insert the tail of the yellow cable tie into its head to fasten it."
+  task: "Fold the fully spread garment neatly, then place it into the basket on the left."
 
 robot:
   type: marvain_m6_http
@@ -117,7 +94,7 @@ robot:
       width: 640
       height: 480
       color_mode: rgb
-  safety_stats_path: /home/zzx23457/openpi_deployment_assets/zadai_200
+  safety_stats_path: /home/zzx23457/权重/clothes_400
   action_clip_margin_deg: 0.05
   max_relative_target_deg: 0.08
   warn_on_observation_out_of_range: true
@@ -142,15 +119,5 @@ inference:
     - wrist_L
     - wrist_R
   rtc:
-    # Enable with: --inference-type rtc
-    execution_horizon: 10
+    execution_horizon: 30
     max_guidance_weight: 10.0
-    prefix_attention_schedule: EXP
-    # pi0.5 returns 50 steps. Start the next inference when 30 remain.
-    queue_threshold: 30
-    # Stable local round-trip is about 3 steps at 30 Hz; updated online afterward.
-    initial_inference_delay_steps: 3
-    latency_margin_steps: 0
-    latency_window: 20
-    max_chunk_steps: 50
-    min_send_steps: 10

@@ -47,7 +47,6 @@ def test_get_observation_preserves_raw_gripper_values(http_robot):
         "joint_states": {"positions": [0.0] * 14},
         "gripper_left": {"position": 0.25},
         "gripper_right": {"position": 0.75},
-        "intervention": {"refresh_generation": 11},
     }
     session.get.return_value = response
     robot._connected = True
@@ -56,7 +55,6 @@ def test_get_observation_preserves_raw_gripper_values(http_robot):
 
     assert observation["left_gripper.pos"] == pytest.approx(0.25)
     assert observation["right_gripper.pos"] == pytest.approx(0.75)
-    assert robot.last_observation_generation == 11
 
 
 def test_prepare_action_preserves_raw_gripper_values(http_robot):
@@ -73,47 +71,10 @@ def test_prepare_action_preserves_raw_gripper_values(http_robot):
     assert result["right_gripper.pos"] == pytest.approx(0.75)
 
 
-def test_sync_action_reference_uses_measured_arm_pose(http_robot):
-    robot, _ = http_robot
-    robot._connected = True
-    observation = {
-        f"{name}.pos": float(index)
-        for index, name in enumerate(robot.config.joint_names)
-    }
-
-    robot.sync_action_reference(observation)
-
-    assert robot._last_sent_pos == pytest.approx([float(index) for index in range(14)])
-
-
-def test_sync_action_reference_rejects_nonfinite_pose(http_robot):
-    robot, _ = http_robot
-    robot._connected = True
-    observation = {
-        f"{name}.pos": float(index)
-        for index, name in enumerate(robot.config.joint_names)
-    }
-    observation["left_arm_joint_1.pos"] = float("nan")
-
-    with pytest.raises(ValueError, match="finite 14-D measured arm pose"):
-        robot.sync_action_reference(observation)
-
-
 def test_send_action_chunk_forwards_source_hz(http_robot):
     robot, session = http_robot
-    response = MagicMock()
-    response.json.return_value = {
-        "success": True,
-        "chunk_id": 17,
-        "execution": "shadow",
-        "action_ids": [
-            {"chunk_id": 17, "step_id": 0},
-            {"chunk_id": 17, "step_id": 1},
-        ],
-    }
-    session.post.return_value = response
+    session.post.return_value = MagicMock()
     robot._connected = True
-    robot._last_observation_generation = 12
     action = {f"{name}.pos": 0.0 for name in robot.config.joint_names}
 
     result = robot.send_action_chunk([action, action], source_hz=7.5)
@@ -121,10 +82,7 @@ def test_send_action_chunk_forwards_source_hz(http_robot):
     assert len(result) == 2
     _, kwargs = session.post.call_args
     assert kwargs["json"]["source_hz"] == pytest.approx(7.5)
-    assert kwargs["json"]["observation_generation"] == 12
     assert len(kwargs["json"]["actions"]) == 2
-    assert robot.last_chunk_metadata["chunk_id"] == 17
-    assert robot.last_chunk_metadata["action_ids"][-1]["step_id"] == 1
 
 
 @pytest.mark.parametrize("source_hz", [0.0, -1.0, float("nan"), float("inf")])

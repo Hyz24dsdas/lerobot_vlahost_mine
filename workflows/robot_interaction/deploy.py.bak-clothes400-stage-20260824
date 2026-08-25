@@ -26,12 +26,12 @@
                                 可选值：base, sentry, highlight, dagger, episodic
     --inference-type TYPE       推理模式（覆盖配置文件）
                                 可选值：sync（默认）, rtc（Real-Time Chunking）
-    --execution-horizon N       RTC模式：新旧chunk连续性引导范围（覆盖配置文件）
+    --execution-horizon N       RTC模式：每次执行N步（覆盖配置文件）
 
 推理模式说明:
     sync       同步模式（默认）：推理整个chunk，全部执行完再推理
-    rtc        Real-Time Chunking：执行当前chunk时异步生成下一chunk，按推理
-               延迟丢弃过时steps，并用旧chunk前缀约束新chunk的连续性
+    rtc        Real-Time Chunking：推理chunk，只执行前N步就重新推理
+               更快响应环境变化，适合动态场景
 
 推理策略说明:
     base       只推理，不录制（默认，最常用）
@@ -60,14 +60,12 @@ import ctypes
 import hashlib
 import json
 import os
-import select
 import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 from urllib import error as urlerror
@@ -115,59 +113,6 @@ def _child_preexec() -> None:
         # Non-Linux: best-effort only, the wrapper-side signal
         # forwarding is the best we can do there.
         pass
-
-
-def _start_openpi_input_controller(
-    proc: subprocess.Popen,
-    *,
-    staged_input_enabled: bool,
-    switch_input: str,
-    record_input: str,
-    start_recording,
-) -> tuple[threading.Thread, threading.Event]:
-    """Handle OpenPI runtime commands while the detached rollout keeps running."""
-    if proc.stdin is None:
-        raise RuntimeError("OpenPI rollout was started without an stdin pipe")
-
-    stop_event = threading.Event()
-
-    def _forward() -> None:
-        try:
-            while proc.poll() is None and not stop_event.is_set():
-                readable, _, _ = select.select([sys.stdin], [], [], 0.25)
-                if not readable:
-                    continue
-                line = sys.stdin.readline()
-                if line == "":
-                    return
-                command = line.strip()
-                if command == record_input:
-                    start_recording()
-                    continue
-                if staged_input_enabled and command == switch_input:
-                    try:
-                        proc.stdin.write(line.encode("utf-8"))
-                        proc.stdin.flush()
-                    except (BrokenPipeError, OSError, ValueError):
-                        return
-                    continue
-                available = [f"{record_input}=开始录制"]
-                if staged_input_enabled:
-                    available.insert(0, f"{switch_input}=切换到 fold prompt")
-                print(f"⚠️  未知交互命令 {command!r}；可用命令: {', '.join(available)}")
-        finally:
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-
-    thread = threading.Thread(
-        target=_forward,
-        name="openpi-input-controller",
-        daemon=True,
-    )
-    thread.start()
-    return thread, stop_event
 
 
 def resolve_policy_path(path: str) -> Path:
@@ -311,10 +256,10 @@ def _run_ros_cli(config: dict, args: list[str], *, timeout_s: float = 15.0) -> s
     )
 
 
-def _start_deployment_recording(config: dict, *, force: bool = False) -> Path | None:
+def _start_deployment_recording(config: dict) -> Path | None:
     """Start one rosbag for this rollout and return its exact directory."""
     recording = config.get("recording", {})
-    if not force and not recording.get("enabled", False):
+    if not recording.get("enabled", False):
         return None
 
     raw_root = _recording_raw_root(config)
@@ -519,12 +464,8 @@ def _ask_to_save_evaluation() -> bool:
 
 
 def _convert_deployment_recording(config: dict, bag_path: Path) -> bool:
-    """Convert the finalized MCAP episode when the recording has full observations."""
+    """Convert the finalized MCAP episode to the required LeRobot v3 schema."""
     recording = config.get("recording", {})
-    if not recording.get("convert_to_lerobot", True):
-        print(f"✓ Action-only rosbag saved without LeRobot conversion: {bag_path}")
-        return True
-
     rdp = Path(
         recording.get("rdp", "/home/zzx23457/robot_data_platform/tool/rdp")
     ).expanduser().resolve()
@@ -909,22 +850,12 @@ def main() -> int:
     parser.add_argument(
         "--execution-horizon",
         type=int,
-        help="RTC模式：新旧chunk连续性引导范围（覆盖 inference.rtc.execution_horizon）"
+        help="RTC模式：每次执行的步数（覆盖配置文件中的 inference.rtc.execution_horizon）"
     )
     parser.add_argument(
         "--max-guidance-weight",
         type=float,
         help="RTC模式：最大引导权重（覆盖配置文件中的 inference.rtc.max_guidance_weight）"
-    )
-    parser.add_argument(
-        "--rtc-prefix-attention-schedule",
-        choices=["LINEAR", "EXP", "ONES", "ZEROS"],
-        help="RTC模式：前缀引导衰减曲线（覆盖 inference.rtc.prefix_attention_schedule）"
-    )
-    parser.add_argument(
-        "--rtc-queue-threshold",
-        type=int,
-        help="RTC模式：剩余动作低于该steps数时启动下一次推理"
     )
     parser.add_argument(
         "--duration",
@@ -1017,14 +948,6 @@ def main() -> int:
         if "rtc" not in config["inference"]:
             config["inference"]["rtc"] = {}
         config["inference"]["rtc"]["max_guidance_weight"] = args.max_guidance_weight
-    if args.rtc_prefix_attention_schedule is not None:
-        config["inference"].setdefault("rtc", {})["prefix_attention_schedule"] = (
-            args.rtc_prefix_attention_schedule
-        )
-    if args.rtc_queue_threshold is not None:
-        config["inference"].setdefault("rtc", {})["queue_threshold"] = (
-            args.rtc_queue_threshold
-        )
     if args.duration is not None:
         config["inference"]["duration"] = args.duration
     if args.interpolation_multiplier:
@@ -1066,18 +989,6 @@ def main() -> int:
     task = config.get("dataset", {}).get("single_task", "")
     if task:
         print(f"✓ Task: {task}")
-    if args.model == "openpi":
-        openpi_inference_type = config.get("inference", {}).get("type", "chunk")
-        print(f"✓ OpenPI inference: {openpi_inference_type}")
-        if openpi_inference_type == "rtc":
-            rtc_config = config["inference"].get("rtc", {})
-            print(
-                "✓ OpenPI RTC: "
-                f"horizon={rtc_config.get('execution_horizon', 10)}, "
-                f"queue_threshold={rtc_config.get('queue_threshold', 30)}, "
-                f"schedule={rtc_config.get('prefix_attention_schedule', 'EXP')}, "
-                f"max_guidance={rtc_config.get('max_guidance_weight', 10.0)}"
-            )
 
     recording_cfg = config.get("recording", {})
     direct_lerobot = (
@@ -1279,10 +1190,6 @@ def main() -> int:
             "checkpoint params": policy_path / "params",
             "checkpoint norm stats": policy_path / "assets" / asset_id / "norm_stats.json",
         }
-        if config["inference"].get("type", "chunk") == "rtc":
-            required_paths["native OpenPI RTC guidance"] = (
-                openpi_server_cwd / "src" / "openpi" / "models" / "rtc.py"
-            )
         missing = [f"{label}: {path}" for label, path in required_paths.items() if not path.exists()]
         if missing:
             print("OpenPI deployment resources are incomplete:")
@@ -1350,23 +1257,7 @@ def main() -> int:
             str(config["inference"].get("duration", 0.0)),
             "--n-action-steps",
             str(config["inference"].get("n_action_steps", 30)),
-            "--inference-type",
-            str(config["inference"].get("type", "chunk")),
         ]
-        if config["inference"].get("type", "chunk") == "rtc":
-            rtc_config = config["inference"].get("rtc", {})
-            cmd.extend(
-                [
-                    "--rtc-execution-horizon",
-                    str(rtc_config.get("execution_horizon", 10)),
-                    "--rtc-max-guidance-weight",
-                    str(rtc_config.get("max_guidance_weight", 10.0)),
-                    "--rtc-prefix-attention-schedule",
-                    str(rtc_config.get("prefix_attention_schedule", "EXP")),
-                    "--rtc-queue-threshold",
-                    str(rtc_config.get("queue_threshold", 30)),
-                ]
-            )
         if config["robot"].get("safety_stats_path"):
             cmd.extend(["--safety-stats-path", str(config["robot"]["safety_stats_path"])])
         env["OPENPI_DATA_HOME"] = str(
@@ -1878,19 +1769,12 @@ def main() -> int:
         else None
     )
 
-    staged_cfg = config.get("staged_task", {})
-    staged_input_enabled = args.model == "openpi" and bool(
-        staged_cfg.get("enabled", False)
-    )
-    staged_switch_input = str(staged_cfg.get("switch_input", "1")).strip()
-
     # Run the child with robust process management.
     try:
         proc = subprocess.Popen(
             cmd,
             env=env,
             preexec_fn=_child_preexec,
-            stdin=subprocess.PIPE if args.model == "openpi" else None,
         )
     except Exception:
         if recording_path is not None:
@@ -2012,7 +1896,6 @@ def main() -> int:
         "watchdog": recording_watchdog,
         "preserve": False,
     }
-    recording_state_lock = threading.Lock()
     direct_dataset_state = {
         "path": direct_dataset_path,
         "watchdog": direct_dataset_watchdog,
@@ -2020,34 +1903,18 @@ def main() -> int:
     }
 
     def _stop_recording_once() -> bool:
-        with recording_state_lock:
-            if not recording_state["active"]:
-                return True
-            # Clear ownership first so repeated signal/finally/atexit paths cannot
-            # stop a later recording started by another evaluation.
-            recording_state["active"] = False
-            stopped = _stop_deployment_recording(config)
-            _terminate_watchdog(recording_state["watchdog"])
-            recording_state["watchdog"] = None
-            path = recording_state["path"]
-            if path is not None:
-                stopped = _wait_for_recording_metadata(path) and stopped
-            return stopped
-
-    def _start_recording_interactively() -> None:
-        with recording_state_lock:
-            if recording_state["active"]:
-                print(f"⏺️  已在录制: {recording_state['path']}")
-                return
-            print("⏺️  正在启动同步 rosbag；OpenPI 推理继续运行...")
-            path = _start_deployment_recording(config, force=True)
-            if path is None:
-                print("❌ 未能启动同步录制；模型推理不受影响")
-                return
-            recording_state["active"] = True
-            recording_state["path"] = path
-            recording_state["watchdog"] = _spawn_recording_watchdog(config, path)
-            print(f"✅ 同步录制已开始: {path}")
+        if not recording_state["active"]:
+            return True
+        # Clear ownership first so repeated signal/finally/atexit paths cannot
+        # stop a later recording started by another evaluation.
+        recording_state["active"] = False
+        stopped = _stop_deployment_recording(config)
+        _terminate_watchdog(recording_state["watchdog"])
+        recording_state["watchdog"] = None
+        path = recording_state["path"]
+        if path is not None:
+            stopped = _wait_for_recording_metadata(path) and stopped
+        return stopped
 
     def _discard_recording_once() -> None:
         _stop_recording_once()
@@ -2072,21 +1939,6 @@ def main() -> int:
     atexit.register(_discard_direct_dataset_once)
     atexit.register(_ensure_child_dead)
 
-    openpi_input_thread: threading.Thread | None = None
-    openpi_input_stop: threading.Event | None = None
-    if args.model == "openpi":
-        openpi_input_thread, openpi_input_stop = _start_openpi_input_controller(
-            proc,
-            staged_input_enabled=staged_input_enabled,
-            switch_input=staged_switch_input,
-            record_input="2",
-            start_recording=_start_recording_interactively,
-        )
-        commands = ["2=开始同步录制（推理保持运行）"]
-        if staged_input_enabled:
-            commands.insert(0, f"{staged_switch_input}=切换到 fold prompt")
-        print(f"\nOpenPI 交互命令: {', '.join(commands)}；Ctrl+C=结束部署。\n")
-
     # 记录是否要在子进程结束后做 wrapper 层的 return-to-home
     return_to_initial = config.get("inference", {}).get("return_to_initial_position", True)
     if return_to_initial:
@@ -2105,15 +1957,6 @@ def main() -> int:
             returncode = 130
     finally:
         _ensure_child_dead()
-
-    if openpi_input_stop is not None:
-        openpi_input_stop.set()
-    if openpi_input_thread is not None:
-        openpi_input_thread.join(timeout=1.0)
-
-    # A recording may have been started interactively after rollout launch.
-    with recording_state_lock:
-        recording_path = recording_state["path"]
 
     if direct_dataset_path is not None:
         _terminate_watchdog(direct_dataset_state["watchdog"])
