@@ -150,10 +150,6 @@ def _start_openpi_input_controller(
                         proc.stdin.flush()
                     except (BrokenPipeError, OSError, ValueError):
                         return
-                    print(
-                        "✅ 已接收阶段切换命令；将在当前 action chunk 周期结束后切换到 fold prompt",
-                        flush=True,
-                    )
                     continue
                 available = [f"{record_input}=开始录制"]
                 if staged_input_enabled:
@@ -1268,7 +1264,6 @@ def main() -> int:
                 "https://github.com/Physical-Intelligence/openpi.git",
             )
         )
-        expected_revision = str(openpi_cfg.get("expected_revision", "")).strip()
         serve_script = openpi_server_cwd / "scripts" / "serve_policy.py"
         openpi_client_src = openpi_server_cwd / "packages" / "openpi-client" / "src"
         rollout_script = Path(__file__).parent / "openpi_rollout.py"
@@ -1303,34 +1298,17 @@ def main() -> int:
                 text=True,
                 timeout=5,
             )
-            revision_result = subprocess.run(
-                ["git", "-C", str(openpi_server_cwd), "rev-parse", "HEAD"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
         except (OSError, subprocess.TimeoutExpired) as exc:
             print(f"Unable to verify the external OpenPI Git origin: {exc}")
             return 2
         actual_origin = origin_result.stdout.strip()
-        actual_revision = revision_result.stdout.strip()
         if origin_result.returncode != 0 or actual_origin != expected_origin:
             print("Refusing to start an unverified OpenPI repository:")
             print(f"  expected origin: {expected_origin}")
             print(f"  actual origin:   {actual_origin or '<unavailable>'}")
             return 2
-        if expected_revision and (
-            revision_result.returncode != 0 or actual_revision != expected_revision
-        ):
-            print("Refusing to start an unexpected OpenPI revision:")
-            print(f"  expected revision: {expected_revision}")
-            print(f"  actual revision:   {actual_revision or '<unavailable>'}")
-            return 2
         print(f"✓ External OpenPI repository: {openpi_server_cwd}")
         print(f"✓ OpenPI origin: {actual_origin}")
-        if expected_revision:
-            print(f"✓ OpenPI revision: {actual_revision}")
         print(f"✓ OpenPI client source: {openpi_client_src}")
 
         openpi_server_host = str(openpi_cfg.get("server_host", "127.0.0.1"))

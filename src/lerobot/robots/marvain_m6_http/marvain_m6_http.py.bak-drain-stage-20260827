@@ -621,51 +621,6 @@ class MarvainM6HttpRobot(Robot):
         self._last_sent_pos = arm_positions.tolist()
 
     @check_if_not_connected
-    def wait_for_action_chunk_completion(
-        self,
-        *,
-        timeout_s: float = 5.0,
-        poll_interval_s: float = 0.02,
-    ) -> dict:
-        """Wait until VLAHost confirms that the active action chunk is exhausted."""
-        timeout_s = float(timeout_s)
-        poll_interval_s = float(poll_interval_s)
-        if not np.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("timeout_s must be finite and positive")
-        if not np.isfinite(poll_interval_s) or poll_interval_s <= 0.0:
-            raise ValueError("poll_interval_s must be finite and positive")
-
-        url = f"{self.config.http_base_url}/state"
-        deadline = time.monotonic() + timeout_s
-        while True:
-            try:
-                response = self._session.get(url, timeout=self.config.timeout)
-                response.raise_for_status()
-                state = response.json()
-            except requests.RequestException as exc:
-                raise DeviceNotConnectedError(
-                    f"Failed while waiting for action chunk completion at {url}: {exc}"
-                ) from exc
-            except ValueError as exc:
-                raise RuntimeError("VLAHost /state returned invalid JSON") from exc
-
-            if not isinstance(state, dict) or "need_new_chunk" not in state:
-                raise RuntimeError(
-                    "VLAHost /state must expose need_new_chunk to guarantee a drained transition"
-                )
-            if int(state["need_new_chunk"] or 0) == 1:
-                return state
-
-            remaining_s = deadline - time.monotonic()
-            if remaining_s <= 0.0:
-                chunk_id = (self._last_chunk_metadata or {}).get("chunk_id", "unknown")
-                raise TimeoutError(
-                    f"Timed out after {timeout_s:.2f}s waiting for action chunk "
-                    f"{chunk_id} to finish"
-                )
-            time.sleep(min(poll_interval_s, remaining_s))
-
-    @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
         """Send action command to HTTP endpoint.
 

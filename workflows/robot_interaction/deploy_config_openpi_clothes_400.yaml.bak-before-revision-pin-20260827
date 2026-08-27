@@ -7,8 +7,7 @@ policy:
 openpi:
   # External native OpenPI checkout. deploy.py verifies this Git origin before startup.
   repo: /home/zzx23457/openpi-official
-  expected_origin: git@github-hyz24:Hyz24dsdas/openpi.git
-  expected_revision: 76532832bff19d21e534e044c492c4527d2eec3c
+  expected_origin: https://github.com/Physical-Intelligence/openpi.git
   uv: /home/zzx23457/.local/bin/uv
   config_name: pi05_hhw_tj_clothes_400_uniform
   cache_dir: /home/zzx23457/.cache/openpi
@@ -33,10 +32,8 @@ staged_task:
   initial_stage: spread
   switch_input: "1"
   transition:
-    # The rollout checks the request at the next control-cycle boundary. Its
-    # chunk-paced loop has already allowed the active 30-step chunk to finish;
-    # waiting again for need_new_chunk can deadlock while intervention owns control.
-    wait_for_current_chunk: false
+    # Input 1 only requests a transition. The active spread chunk must finish first.
+    wait_for_current_chunk: true
     completion_timeout_s: 5.0
     completion_poll_interval_s: 0.02
   stages:

@@ -99,50 +99,6 @@ def test_sync_action_reference_rejects_nonfinite_pose(http_robot):
         robot.sync_action_reference(observation)
 
 
-def test_wait_for_action_chunk_completion_waits_for_need_new_chunk(http_robot):
-    robot, session = http_robot
-    robot._connected = True
-    pending = MagicMock()
-    pending.json.return_value = {"need_new_chunk": 0}
-    complete = MagicMock()
-    complete.json.return_value = {"need_new_chunk": 1}
-    session.get.side_effect = [pending, complete]
-
-    state = robot.wait_for_action_chunk_completion(
-        timeout_s=0.1,
-        poll_interval_s=0.001,
-    )
-
-    assert state["need_new_chunk"] == 1
-    assert session.get.call_count == 2
-
-
-def test_wait_for_action_chunk_completion_requires_server_signal(http_robot):
-    robot, session = http_robot
-    robot._connected = True
-    response = MagicMock()
-    response.json.return_value = {"joint_states": {"positions": [0.0] * 14}}
-    session.get.return_value = response
-
-    with pytest.raises(RuntimeError, match="must expose need_new_chunk"):
-        robot.wait_for_action_chunk_completion(timeout_s=0.1)
-
-
-def test_wait_for_action_chunk_completion_times_out_without_replacing_chunk(http_robot):
-    robot, session = http_robot
-    robot._connected = True
-    robot._last_chunk_metadata = {"chunk_id": 23}
-    response = MagicMock()
-    response.json.return_value = {"need_new_chunk": 0}
-    session.get.return_value = response
-
-    with (
-        patch(f"{MODULE}.time.monotonic", side_effect=[0.0, 1.0]),
-        pytest.raises(TimeoutError, match="chunk 23"),
-    ):
-        robot.wait_for_action_chunk_completion(timeout_s=0.1)
-
-
 def test_send_action_chunk_forwards_source_hz(http_robot):
     robot, session = http_robot
     response = MagicMock()

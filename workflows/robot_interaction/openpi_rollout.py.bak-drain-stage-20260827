@@ -98,9 +98,6 @@ class PromptStageController:
         self._current_stage = "default"
         self._switch_input = "1"
         self._prompts = {"default": str(config["dataset"]["single_task"])}
-        self.wait_for_current_chunk = False
-        self.completion_timeout_s = 5.0
-        self.completion_poll_interval_s = 0.02
 
         if not self.enabled:
             return
@@ -131,21 +128,6 @@ class PromptStageController:
             raise ValueError("staged_task.switch_input must be non-empty")
         self._prompts = {"spread": spread_prompt, "fold": fold_prompt}
         self._current_stage = initial_stage
-        transition = staged_cfg.get("transition", {})
-        self.wait_for_current_chunk = bool(transition.get("wait_for_current_chunk", True))
-        self.completion_timeout_s = float(transition.get("completion_timeout_s", 5.0))
-        self.completion_poll_interval_s = float(
-            transition.get("completion_poll_interval_s", 0.02)
-        )
-        if not np.isfinite(self.completion_timeout_s) or self.completion_timeout_s <= 0.0:
-            raise ValueError("staged_task.transition.completion_timeout_s must be positive")
-        if (
-            not np.isfinite(self.completion_poll_interval_s)
-            or self.completion_poll_interval_s <= 0.0
-        ):
-            raise ValueError(
-                "staged_task.transition.completion_poll_interval_s must be positive"
-            )
 
     @property
     def current_stage(self) -> str:
@@ -154,14 +136,6 @@ class PromptStageController:
     @property
     def prompt(self) -> str:
         return self._prompts[self._current_stage]
-
-    @property
-    def switch_pending(self) -> bool:
-        return (
-            self.enabled
-            and self._current_stage == "spread"
-            and self._switch_requested.is_set()
-        )
 
     def start_input_listener(self) -> None:
         if not self.enabled:
@@ -187,14 +161,7 @@ class PromptStageController:
             value = line.strip()
             if value == self._switch_input:
                 self._switch_requested.set()
-                if self.wait_for_current_chunk:
-                    LOG.info(
-                        "Fold-stage switch requested; waiting for the current action chunk to finish"
-                    )
-                else:
-                    LOG.info(
-                        "Fold-stage switch requested; switching at the next control-cycle boundary"
-                    )
+                LOG.info("Fold-stage switch requested; waiting for the current control cycle")
                 return
             if value:
                 LOG.warning(
@@ -203,14 +170,12 @@ class PromptStageController:
                     self._switch_input,
                 )
 
-    def apply_pending_switch(self, *, current_chunk_drained: bool = False) -> bool:
+    def apply_pending_switch(self) -> bool:
         if (
             not self.enabled
             or self._current_stage != "spread"
             or not self._switch_requested.is_set()
         ):
-            return False
-        if self.wait_for_current_chunk and not current_chunk_drained:
             return False
         self._current_stage = "fold"
         self._switch_requested.clear()
@@ -373,10 +338,6 @@ def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        # Some imported LeRobot/OpenPI modules install a root handler before
-        # main() runs.  Without force=True, basicConfig becomes a no-op and the
-        # inherited WARNING level hides stage-switch and chunk-dispatch logs.
-        force=True,
     )
     config = load_config(args.config)
     if args.http_base_url is not None:
@@ -477,52 +438,18 @@ def main() -> int:
                     if stop_requested:
                         break
 
-                current_chunk_drained = False
-                if (
-                    stage_controller.switch_pending
-                    and stage_controller.wait_for_current_chunk
-                ):
-                    active_chunk = robot.last_chunk_metadata or {}
-                    chunk_id = active_chunk.get("chunk_id", "unknown")
-                    LOG.info(
-                        "Fold-stage switch pending: waiting for spread chunk %s "
-                        "to finish completely",
-                        chunk_id,
-                    )
-                    wait_started = time.monotonic()
-                    robot.wait_for_action_chunk_completion(
-                        timeout_s=stage_controller.completion_timeout_s,
-                        poll_interval_s=stage_controller.completion_poll_interval_s,
-                    )
-                    current_chunk_drained = True
-                    LOG.info(
-                        "Spread chunk %s finished in %.3fs; holding its final joint and gripper "
-                        "setpoint while fold inference runs",
-                        chunk_id,
-                        time.monotonic() - wait_started,
-                    )
-
                 cycle_started = time.monotonic()
                 robot_observation = robot.get_observation()
-                stage_switched = stage_controller.apply_pending_switch(
-                    current_chunk_drained=current_chunk_drained,
-                )
+                stage_switched = stage_controller.apply_pending_switch()
                 if stage_switched:
                     robot.sync_action_reference(robot_observation)
                     if rtc_scheduler is not None:
                         rtc_scheduler.reset_prefix()
-                    if stage_controller.wait_for_current_chunk:
-                        LOG.info(
-                            "Stage switched to fold after the spread chunk drained. "
-                            "The robot remains at the final spread action until fold inference "
-                            "completes; prompt=%r",
-                            stage_controller.prompt,
-                        )
-                    else:
-                        LOG.info(
-                            "Stage switched to fold at the control-cycle boundary; prompt=%r",
-                            stage_controller.prompt,
-                        )
+                    LOG.info(
+                        "Stage switched to fold. Pending spread actions will be replaced by the next chunk; "
+                        "prompt=%r",
+                        stage_controller.prompt,
+                    )
                 observation = _observation_for_policy(
                     config,
                     robot_observation,
